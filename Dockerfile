@@ -1,32 +1,3 @@
-# # Base Node.js image
-# FROM node:18-alpine
-
-# # Set working directory
-# WORKDIR /app
-
-# # Copy package manager files and install dependencies
-# COPY pnpm-workspace.yaml ./
-# COPY pnpm-lock.yaml ./
-# COPY packages ./packages
-# COPY patches ./patches
-# COPY tsconfig.json ./tsconfig.json
-# COPY tsconfig.build.json ./tsconfig.build.json
-# COPY package.json ./package.json
-
-# # Install dependencies
-# RUN npm install -g pnpm && pnpm install --frozen-lockfile
-
-# # Copy the rest of the application
-# COPY . .
-
-# # Expose the port n8n runs on
-# EXPOSE 5678
-
-# # Start the application
-# CMD ["pnpm", "start"]
-
-# Commenting previous content and adding new content
-
 # Base Node.js image
 FROM node:18-alpine
 
@@ -36,9 +7,31 @@ WORKDIR /app
 # Install n8n directly using npm
 RUN npm install n8n -g
 
+ARG PGPASSWORD
+ARG PGHOST
+ARG PGPORT
+ARG PGDATABASE
+ARG PGUSER
+ARG ENCRYPTION_KEY
+
 # Set environment variables
 ENV NODE_ENV=production
 ENV N8N_PORT=5678
+
+ENV DB_TYPE=postgresdb
+ENV DB_POSTGRESDB_DATABASE=railway
+ENV DB_POSTGRESDB_HOST=postgres.railway.internal
+ENV DB_POSTGRESDB_PORT=5432
+ENV DB_POSTGRESDB_USER=postgres
+ENV DB_POSTGRESDB_PASSWORD=zTsgcoUWHLvzKlrNRGeBuHwQAgsNfhOQ
+ENV N8N_ENCRYPTION_KEY=V1akYrrswN4l2oGRNacW/bpkvo7mVOYK5yB9loOrA+Q=
+# ENV DB_TYPE=postgresdb
+# ENV DB_POSTGRESDB_DATABASE=$PGDATABASE
+# ENV DB_POSTGRESDB_HOST=$PGHOST
+# ENV DB_POSTGRESDB_PORT=$PGPORT
+# ENV DB_POSTGRESDB_USER=$PGUSER
+# ENV DB_POSTGRESDB_PASSWORD=$PGPASSWORD
+# ENV N8N_ENCRYPTION_KEY=$ENCRYPTION_KEY
 
 # Expose the port n8n runs on
 EXPOSE 5678
