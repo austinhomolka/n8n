@@ -1,4 +1,4 @@
-import { ApplicationError } from 'n8n-workflow';
+import { ApplicationError } from '@n8n/errors';
 import type {
 	ITriggerFunctions,
 	IDataObject,
@@ -7,8 +7,8 @@ import type {
 	INodeListSearchItems,
 } from 'n8n-workflow';
 
+import { configurePostgres } from './transport';
 import type { PgpDatabase, PostgresNodeCredentials } from './v2/helpers/interfaces';
-import { configurePostgres } from './v2/transport';
 
 export function prepareNames(id: string, mode: string, additionalFields: IDataObject) {
 	let suffix = id.replace(/-/g, '_');

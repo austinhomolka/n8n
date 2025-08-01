@@ -1,3 +1,5 @@
+import { OnPubSubEvent } from '@n8n/decorators';
+import { Service } from '@n8n/di';
 import type express from 'express';
 import { InstanceSettings } from 'n8n-core';
 import { WebhookPathTakenError, Workflow } from 'n8n-workflow';
@@ -6,14 +8,13 @@ import type {
 	IWorkflowExecuteAdditionalData,
 	IHttpRequestMethods,
 	IRunData,
+	IWorkflowBase,
 } from 'n8n-workflow';
-import { Service } from 'typedi';
 
 import { TEST_WEBHOOK_TIMEOUT } from '@/constants';
 import { NotFoundError } from '@/errors/response-errors/not-found.error';
 import { WebhookNotFoundError } from '@/errors/response-errors/webhook-not-found.error';
 import { WorkflowMissingIdError } from '@/errors/workflow-missing-id.error';
-import type { IWorkflowDb } from '@/interfaces';
 import { NodeTypes } from '@/node-types';
 import { Push } from '@/push';
 import { Publisher } from '@/scaling/pubsub/publisher.service';
@@ -24,6 +25,8 @@ import * as WebhookHelpers from '@/webhooks/webhook-helpers';
 import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-data';
 import type { WorkflowRequest } from '@/workflows/workflow.request';
 
+import { authAllowlistedNodes } from './constants';
+import { sanitizeWebhookRequest } from './webhook-request-sanitizer';
 import { WebhookService } from './webhook.service';
 import type {
 	IWebhookResponseCallbackData,
@@ -113,6 +116,10 @@ export class TestWebhooks implements IWebhookManager {
 			throw new NotFoundError('Could not find node to process webhook.');
 		}
 
+		if (!authAllowlistedNodes.has(workflowStartNode.type)) {
+			sanitizeWebhookRequest(request);
+		}
+
 		return await new Promise(async (resolve, reject) => {
 			try {
 				const executionMode = 'manual';
@@ -154,11 +161,7 @@ export class TestWebhooks implements IWebhookManager {
 			 * the webhook. If so, after the test webhook has been successfully executed,
 			 * the handler process commands the creator process to clear its test webhooks.
 			 */
-			if (
-				this.instanceSettings.isMultiMain &&
-				pushRef &&
-				!this.push.getBackend().hasPushRef(pushRef)
-			) {
+			if (this.instanceSettings.isMultiMain && pushRef && !this.push.hasPushRef(pushRef)) {
 				void this.publisher.publishCommand({
 					command: 'clear-test-webhooks',
 					payload: { webhookKey: key, workflowEntity, pushRef },
@@ -172,13 +175,33 @@ export class TestWebhooks implements IWebhookManager {
 		});
 	}
 
+	@OnPubSubEvent('clear-test-webhooks', { instanceType: 'main' })
+	async handleClearTestWebhooks({
+		webhookKey,
+		workflowEntity,
+		pushRef,
+	}: {
+		webhookKey: string;
+		workflowEntity: IWorkflowBase;
+		pushRef: string;
+	}) {
+		if (!this.push.hasPushRef(pushRef)) return;
+
+		this.clearTimeout(webhookKey);
+
+		const workflow = this.toWorkflow(workflowEntity);
+
+		await this.deactivateWebhooks(workflow);
+	}
+
 	clearTimeout(key: string) {
 		const timeout = this.timeouts[key];
 
 		if (timeout) clearTimeout(timeout);
 	}
 
-	async getWebhookMethods(path: string) {
+	async getWebhookMethods(rawPath: string) {
+		const path = removeTrailingSlash(rawPath);
 		const allKeys = await this.registrations.getAllKeys();
 
 		const webhookMethods = allKeys
@@ -221,7 +244,7 @@ export class TestWebhooks implements IWebhookManager {
 	 */
 	async needsWebhook(options: {
 		userId: string;
-		workflowEntity: IWorkflowDb;
+		workflowEntity: IWorkflowBase;
 		additionalData: IWorkflowExecuteAdditionalData;
 		runData?: IRunData;
 		pushRef?: string;
@@ -438,9 +461,10 @@ export class TestWebhooks implements IWebhookManager {
 	}
 
 	/**
-	 * Convert a `WorkflowEntity` from `typeorm` to a temporary `Workflow` from `n8n-workflow`.
+	 * Convert a `IWorkflowBase` interface (e.g. `WorkflowEntity`) to a temporary
+	 * `Workflow` from `n8n-workflow`.
 	 */
-	toWorkflow(workflowEntity: IWorkflowDb) {
+	toWorkflow(workflowEntity: IWorkflowBase) {
 		return new Workflow({
 			id: workflowEntity.id,
 			name: workflowEntity.name,

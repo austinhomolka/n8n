@@ -1,42 +1,85 @@
-import type { IRunExecutionData, IPinData } from 'n8n-workflow';
+import type {
+	NodeParameterValueType,
+	INodeParameterResourceLocator,
+	IRunData,
+	INodeExecutionData,
+} from 'n8n-workflow';
+import { NodeConnectionTypes } from 'n8n-workflow';
 
-import type { MockedNodeItem } from '@/databases/entities/test-definition.ee';
-import type { WorkflowEntity } from '@/databases/entities/workflow-entity';
+type TokenUsageValues = {
+	completionTokens: number;
+	promptTokens: number;
+	totalTokens: number;
+};
 
-/**
- * Extracts the execution data from the past execution
- * and creates a pin data object from it for the given workflow.
- * It uses a list of mocked nodes defined in a test definition
- * to decide which nodes to pin.
- */
-export function createPinData(
-	workflow: WorkflowEntity,
-	mockedNodes: MockedNodeItem[],
-	executionData: IRunExecutionData,
-) {
-	const pinData = {} as IPinData;
+type TokenUsageInfo = Record<`${string}__${number}` | 'total', TokenUsageValues>;
 
-	const workflowNodeNames = new Set(workflow.nodes.map((node) => node.name));
+function isRlcValue(value: NodeParameterValueType): value is INodeParameterResourceLocator {
+	return Boolean(
+		typeof value === 'object' && value && 'value' in value && '__rl' in value && value.__rl,
+	);
+}
 
-	for (const mockedNode of mockedNodes) {
-		if (workflowNodeNames.has(mockedNode.name)) {
-			const nodeData = executionData.resultData.runData[mockedNode.name];
-			if (nodeData?.[0]?.data?.main?.[0]) {
-				pinData[mockedNode.name] = nodeData[0]?.data?.main?.[0];
+export function checkNodeParameterNotEmpty(value: NodeParameterValueType) {
+	if (value === undefined || value === null || value === '') {
+		return false;
+	}
+
+	if (isRlcValue(value)) {
+		return checkNodeParameterNotEmpty(value.value);
+	}
+
+	return true;
+}
+
+export function extractTokenUsage(executionRunData: IRunData) {
+	const result: TokenUsageInfo = {
+		total: {
+			completionTokens: 0,
+			promptTokens: 0,
+			totalTokens: 0,
+		},
+	};
+
+	const extractFromNode = (nodeName: string, nodeData: INodeExecutionData, index: number) => {
+		function isValidTokenInfo(data: unknown): data is TokenUsageValues {
+			return (
+				typeof data === 'object' &&
+				data !== null &&
+				'completionTokens' in data &&
+				'promptTokens' in data &&
+				'totalTokens' in data &&
+				typeof data.completionTokens === 'number' &&
+				typeof data.promptTokens === 'number' &&
+				typeof data.totalTokens === 'number'
+			);
+		}
+
+		const tokenInfo = nodeData.json?.tokenUsage ?? nodeData.json?.tokenUsageEstimate;
+
+		if (tokenInfo && isValidTokenInfo(tokenInfo)) {
+			result[`${nodeName}__${index}`] = {
+				completionTokens: tokenInfo.completionTokens,
+				promptTokens: tokenInfo.promptTokens,
+				totalTokens: tokenInfo.totalTokens,
+			};
+
+			result.total.completionTokens += tokenInfo.completionTokens;
+			result.total.promptTokens += tokenInfo.promptTokens;
+			result.total.totalTokens += tokenInfo.totalTokens;
+		}
+	};
+
+	for (const [nodeName, nodeData] of Object.entries(executionRunData)) {
+		if (nodeData[0]?.data?.[NodeConnectionTypes.AiLanguageModel]) {
+			for (const [index, node] of nodeData.entries()) {
+				const modelNodeExecutionData = node.data?.[NodeConnectionTypes.AiLanguageModel]?.[0]?.[0];
+				if (modelNodeExecutionData) {
+					extractFromNode(nodeName, modelNodeExecutionData, index);
+				}
 			}
 		}
 	}
 
-	return pinData;
-}
-
-/**
- * Returns the trigger node of the past execution.
- * The trigger node is the node that has no source and has run data.
- */
-export function getPastExecutionTriggerNode(executionData: IRunExecutionData) {
-	return Object.keys(executionData.resultData.runData).find((nodeName) => {
-		const data = executionData.resultData.runData[nodeName];
-		return !data[0].source || data[0].source.length === 0 || data[0].source[0] === null;
-	});
+	return result;
 }

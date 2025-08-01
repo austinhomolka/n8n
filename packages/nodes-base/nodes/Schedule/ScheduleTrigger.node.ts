@@ -6,7 +6,7 @@ import type {
 	INodeTypeDescription,
 	ITriggerResponse,
 } from 'n8n-workflow';
-import { NodeConnectionType, NodeOperationError } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
 import { intervalToRecurrence, recurrenceCheck, toCronExpression } from './GenericFunctions';
 import type { IRecurrenceRule, Rule } from './SchedulerInterface';
@@ -28,11 +28,11 @@ export class ScheduleTrigger implements INodeType {
 		},
 
 		inputs: [],
-		outputs: [NodeConnectionType.Main],
+		outputs: [NodeConnectionTypes.Main],
 		properties: [
 			{
 				displayName:
-					'This workflow will run on the schedule you define here once you <a data-key="activate">activate</a> it.<br><br>For testing, you can also trigger it manually: by going back to the canvas and clicking \'test workflow\'',
+					'This workflow will run on the schedule you define here once you <a data-key="activate">activate</a> it.<br><br>For testing, you can also trigger it manually: by going back to the canvas and clicking \'execute workflow\'',
 				name: 'notice',
 				type: 'notice',
 				default: '',
@@ -451,7 +451,8 @@ export class ScheduleTrigger implements INodeType {
 		if (this.getMode() !== 'manual') {
 			for (const { interval, cronExpression, recurrence } of rules) {
 				try {
-					this.helpers.registerCron(cronExpression, () => executeTrigger(recurrence));
+					const cron = { expression: cronExpression, recurrence };
+					this.helpers.registerCron(cron, () => executeTrigger(recurrence));
 				} catch (error) {
 					if (interval.field === 'cronExpression') {
 						throw new NodeOperationError(this.getNode(), 'Invalid cron expression', {

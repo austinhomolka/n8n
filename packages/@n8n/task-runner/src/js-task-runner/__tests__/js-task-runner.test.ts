@@ -1,7 +1,10 @@
-import { mock } from 'jest-mock-extended';
-import { DateTime } from 'luxon';
-import type { IBinaryData } from 'n8n-workflow';
-import { setGlobalState, type CodeExecutionMode, type IDataObject } from 'n8n-workflow';
+import { DateTime, Duration, Interval } from 'luxon';
+import {
+	type IBinaryData,
+	setGlobalState,
+	type CodeExecutionMode,
+	type IDataObject,
+} from 'n8n-workflow';
 import fs from 'node:fs';
 import { builtinModules } from 'node:module';
 
@@ -18,18 +21,25 @@ import {
 	type DataRequestResponse,
 	type InputDataChunkDefinition,
 } from '@/runner-types';
-import type { Task } from '@/task-runner';
+import type { TaskParams } from '@/task-runner';
 
 import {
 	newDataRequestResponse,
-	newTaskWithSettings,
+	newTaskParamsWithSettings,
+	newTaskState,
 	withPairedItem,
 	wrapIntoJson,
 } from './test-data';
+import { ReservedKeyFoundError } from '../errors/reserved-key-not-found.error';
 
 jest.mock('ws');
 
 const defaultConfig = new MainConfig();
+defaultConfig.jsRunnerConfig ??= {
+	allowedBuiltInModules: '',
+	allowedExternalModules: '',
+	insecureMode: false,
+};
 
 describe('JsTaskRunner', () => {
 	const createRunnerWithOpts = (
@@ -50,7 +60,7 @@ describe('JsTaskRunner', () => {
 				...jsRunnerOpts,
 			},
 			sentryConfig: {
-				sentryDsn: '',
+				dsn: '',
 				deploymentName: '',
 				environment: '',
 				n8nVersion: '',
@@ -64,12 +74,12 @@ describe('JsTaskRunner', () => {
 		taskData,
 		runner = defaultTaskRunner,
 	}: {
-		task: Task<JSExecSettings>;
+		task: TaskParams<JSExecSettings>;
 		taskData: DataRequestResponse;
 		runner?: JsTaskRunner;
 	}) => {
 		jest.spyOn(runner, 'requestData').mockResolvedValue(taskData);
-		return await runner.executeTask(task, mock<AbortSignal>());
+		return await runner.executeTask(task, new AbortController().signal);
 	};
 
 	afterEach(() => {
@@ -88,7 +98,7 @@ describe('JsTaskRunner', () => {
 		runner?: JsTaskRunner;
 	}) => {
 		return await execTaskWithParams({
-			task: newTaskWithSettings({
+			task: newTaskParamsWithSettings({
 				code,
 				nodeMode: 'runOnceForAllItems',
 				...settings,
@@ -112,7 +122,7 @@ describe('JsTaskRunner', () => {
 		chunk?: InputDataChunkDefinition;
 	}) => {
 		return await execTaskWithParams({
-			task: newTaskWithSettings({
+			task: newTaskParamsWithSettings({
 				code,
 				nodeMode: 'runOnceForEachItem',
 				chunk,
@@ -128,7 +138,7 @@ describe('JsTaskRunner', () => {
 			'should make an rpc call for console log in %s mode',
 			async (nodeMode) => {
 				jest.spyOn(defaultTaskRunner, 'makeRpcCall').mockResolvedValue(undefined);
-				const task = newTaskWithSettings({
+				const task = newTaskParamsWithSettings({
 					code: "console.log('Hello', 'world!'); return {}",
 					nodeMode,
 				});
@@ -139,13 +149,14 @@ describe('JsTaskRunner', () => {
 				});
 
 				expect(defaultTaskRunner.makeRpcCall).toHaveBeenCalledWith(task.taskId, 'logNodeOutput', [
-					'Hello world!',
+					"'Hello'",
+					"'world!'",
 				]);
 			},
 		);
 
 		it('should not throw when using unsupported console methods', async () => {
-			const task = newTaskWithSettings({
+			const task = newTaskParamsWithSettings({
 				code: `
 					console.warn('test');
 					console.error('test');
@@ -172,6 +183,44 @@ describe('JsTaskRunner', () => {
 					taskData: newDataRequestResponse([wrapIntoJson({})]),
 				}),
 			).resolves.toBeDefined();
+		});
+
+		it('should not throw when trying to log the context object', async () => {
+			const task = newTaskParamsWithSettings({
+				code: `
+					console.log(this);
+					return {json: {}}
+				`,
+				nodeMode: 'runOnceForAllItems',
+			});
+
+			await expect(
+				execTaskWithParams({
+					task,
+					taskData: newDataRequestResponse([wrapIntoJson({})]),
+				}),
+			).resolves.toBeDefined();
+		});
+
+		it('should log the context object as [[ExecutionContext]]', async () => {
+			const rpcCallSpy = jest.spyOn(defaultTaskRunner, 'makeRpcCall').mockResolvedValue(undefined);
+
+			const task = newTaskParamsWithSettings({
+				code: `
+					console.log(this);
+					return {json: {}}
+				`,
+				nodeMode: 'runOnceForAllItems',
+			});
+
+			await execTaskWithParams({
+				task,
+				taskData: newDataRequestResponse([wrapIntoJson({})]),
+			});
+
+			expect(rpcCallSpy).toHaveBeenCalledWith(task.taskId, 'logNodeOutput', [
+				'[[ExecutionContext]]',
+			]);
 		});
 	});
 
@@ -263,6 +312,7 @@ describe('JsTaskRunner', () => {
 				['typeof clearInterval', 'function'],
 				['typeof clearImmediate', 'function'],
 			],
+			eval: [['eval("1+2")', 3]],
 			'JS built-ins': [
 				['typeof btoa', 'function'],
 				['typeof atob', 'function'],
@@ -297,7 +347,7 @@ describe('JsTaskRunner', () => {
 		describe('$env', () => {
 			it('should have the env available in context when access has not been blocked', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $env.VAR1 }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -316,7 +366,7 @@ describe('JsTaskRunner', () => {
 			it('should be possible to access env if it has been blocked', async () => {
 				await expect(
 					execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: 'return { val: $env.VAR1 }',
 							nodeMode: 'runOnceForAllItems',
 						}),
@@ -333,7 +383,7 @@ describe('JsTaskRunner', () => {
 
 			it('should not be possible to iterate $env', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return Object.values($env).concat(Object.keys($env))',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -352,7 +402,7 @@ describe('JsTaskRunner', () => {
 			it("should not expose task runner's env variables even if no env state is received", async () => {
 				process.env.N8N_RUNNERS_TASK_BROKER_URI = 'http://127.0.0.1:5679';
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $env.N8N_RUNNERS_TASK_BROKER_URI }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -373,7 +423,7 @@ describe('JsTaskRunner', () => {
 				};
 
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $now.toSeconds() }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -390,7 +440,7 @@ describe('JsTaskRunner', () => {
 				});
 
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $now.toSeconds() }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -405,7 +455,7 @@ describe('JsTaskRunner', () => {
 		describe("$getWorkflowStaticData('global')", () => {
 			it('should have the global workflow static data available in runOnceForAllItems', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $getWorkflowStaticData("global") }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -421,7 +471,7 @@ describe('JsTaskRunner', () => {
 
 			it('should have the global workflow static data available in runOnceForEachItem', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $getWorkflowStaticData("global") }',
 						nodeMode: 'runOnceForEachItem',
 					}),
@@ -441,7 +491,7 @@ describe('JsTaskRunner', () => {
 				"does not return static data if it hasn't been modified in %s",
 				async (mode) => {
 					const outcome = await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `
 								const staticData = $getWorkflowStaticData("global");
 								return { val: staticData };
@@ -463,7 +513,7 @@ describe('JsTaskRunner', () => {
 				'returns the updated static data in %s',
 				async (mode) => {
 					const outcome = await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `
 								const staticData = $getWorkflowStaticData("global");
 								staticData.newKey = 'newValue';
@@ -502,7 +552,7 @@ describe('JsTaskRunner', () => {
 
 			it('should have the node workflow static data available in runOnceForAllItems', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $getWorkflowStaticData("node") }',
 						nodeMode: 'runOnceForAllItems',
 					}),
@@ -514,7 +564,7 @@ describe('JsTaskRunner', () => {
 
 			it('should have the node workflow static data available in runOnceForEachItem', async () => {
 				const outcome = await execTaskWithParams({
-					task: newTaskWithSettings({
+					task: newTaskParamsWithSettings({
 						code: 'return { val: $getWorkflowStaticData("node") }',
 						nodeMode: 'runOnceForEachItem',
 					}),
@@ -530,7 +580,7 @@ describe('JsTaskRunner', () => {
 				"does not return static data if it hasn't been modified in %s",
 				async (mode) => {
 					const outcome = await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `
 								const staticData = $getWorkflowStaticData("node");
 								return { val: staticData };
@@ -548,7 +598,7 @@ describe('JsTaskRunner', () => {
 				'returns the updated static data in %s',
 				async (mode) => {
 					const outcome = await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `
 								const staticData = $getWorkflowStaticData("node");
 								staticData.newKey = 'newValue';
@@ -623,7 +673,7 @@ describe('JsTaskRunner', () => {
 
 					// Act
 					await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `await ${group.invocation}; return []`,
 							nodeMode: 'runOnceForAllItems',
 						}),
@@ -645,7 +695,7 @@ describe('JsTaskRunner', () => {
 
 					// Act
 					await execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: `await ${group.invocation}; return {}`,
 							nodeMode: 'runOnceForEachItem',
 						}),
@@ -686,7 +736,7 @@ describe('JsTaskRunner', () => {
 
 		it('should allow access to Node.js Buffers', async () => {
 			const outcomeAll = await execTaskWithParams({
-				task: newTaskWithSettings({
+				task: newTaskParamsWithSettings({
 					code: 'return { val: Buffer.from("test-buffer").toString() }',
 					nodeMode: 'runOnceForAllItems',
 				}),
@@ -698,7 +748,7 @@ describe('JsTaskRunner', () => {
 			expect(outcomeAll.result).toEqual([wrapIntoJson({ val: 'test-buffer' })]);
 
 			const outcomePer = await execTaskWithParams({
-				task: newTaskWithSettings({
+				task: newTaskParamsWithSettings({
 					code: 'return { val: Buffer.from("test-buffer").toString() }',
 					nodeMode: 'runOnceForEachItem',
 				}),
@@ -760,6 +810,15 @@ describe('JsTaskRunner', () => {
 					}),
 				).rejects.toThrow(ValidationError);
 			});
+
+			it('should throw a ReservedKeyFoundError if there are unknown keys alongside reserved keys', async () => {
+				await expect(
+					executeForAllItems({
+						code: 'return [{json: {b: 1}, objectId: "123"}]',
+						inputItems: [{ a: 1 }],
+					}),
+				).rejects.toThrow(ReservedKeyFoundError);
+			});
 		});
 
 		it('should return static items', async () => {
@@ -810,7 +869,7 @@ describe('JsTaskRunner', () => {
 			});
 		});
 
-		test.each([['items'], ['$input.all()'], ["$('Trigger').all()"]])(
+		test.each([['items'], ['$input.all()'], ["$('Trigger').all()"], ['$items()']])(
 			'should have all input items in the context as %s',
 			async (expression) => {
 				const outcome = await executeForAllItems({
@@ -1166,7 +1225,7 @@ describe('JsTaskRunner', () => {
 			async (nodeMode) => {
 				await expect(
 					execTaskWithParams({
-						task: newTaskWithSettings({
+						task: newTaskParamsWithSettings({
 							code: 'unknown',
 							nodeMode,
 						}),
@@ -1179,12 +1238,13 @@ describe('JsTaskRunner', () => {
 		it('sends serializes an error correctly', async () => {
 			const runner = createRunnerWithOpts({});
 			const taskId = '1';
-			const task = newTaskWithSettings({
+			const task = newTaskState(taskId);
+			const taskSettings: JSExecSettings = {
 				code: 'unknown; return []',
 				nodeMode: 'runOnceForAllItems',
 				continueOnFail: false,
 				workflowMode: 'manual',
-			});
+			};
 			runner.runningTasks.set(taskId, task);
 
 			const sendSpy = jest.spyOn(runner.ws, 'send').mockImplementation(() => {});
@@ -1193,7 +1253,7 @@ describe('JsTaskRunner', () => {
 				.spyOn(runner, 'requestData')
 				.mockResolvedValue(newDataRequestResponse([wrapIntoJson({ a: 1 })]));
 
-			await runner.receivedSettings(taskId, task.settings);
+			await runner.receivedSettings(taskId, taskSettings);
 
 			expect(sendSpy).toHaveBeenCalled();
 			const calledWith = sendSpy.mock.calls[0][0] as string;
@@ -1265,11 +1325,7 @@ describe('JsTaskRunner', () => {
 			const emitSpy = jest.spyOn(runner, 'emit');
 			jest.spyOn(runner, 'executeTask').mockResolvedValue({ result: [] });
 
-			runner.runningTasks.set(taskId, {
-				taskId,
-				active: true,
-				cancelled: false,
-			});
+			runner.runningTasks.set(taskId, newTaskState(taskId));
 
 			jest.advanceTimersByTime(idleTimeout * 1000 - 100);
 			expect(emitSpy).not.toHaveBeenCalledWith('runner:reached-idle-timeout');
@@ -1296,15 +1352,181 @@ describe('JsTaskRunner', () => {
 			const runner = createRunnerWithOpts({}, { idleTimeout });
 			const taskId = '123';
 			const emitSpy = jest.spyOn(runner, 'emit');
+			const task = newTaskState(taskId);
 
-			runner.runningTasks.set(taskId, {
-				taskId,
-				active: true,
-				cancelled: false,
-			});
+			runner.runningTasks.set(taskId, task);
 
 			jest.advanceTimersByTime(idleTimeout * 1000);
 			expect(emitSpy).not.toHaveBeenCalledWith('runner:reached-idle-timeout');
+			task.cleanup();
+		});
+	});
+
+	describe('prototype pollution prevention', () => {
+		const checkPrototypeIntact = () => {
+			const obj: Record<string, unknown> = {};
+			expect(obj.maliciousKey).toBeUndefined();
+		};
+
+		test('Object.setPrototypeOf should no-op for local object', async () => {
+			checkPrototypeIntact();
+
+			const outcome = await executeForAllItems({
+				code: `
+					const obj = {};
+					Object.setPrototypeOf(obj, { maliciousKey: 'value' });
+					return [{ json: { prototypeChanged: obj.maliciousKey !== undefined } }];
+				`,
+				inputItems: [{ a: 1 }],
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ prototypeChanged: false })]);
+			checkPrototypeIntact();
+		});
+
+		test('Reflect.setPrototypeOf should no-op for local object', async () => {
+			checkPrototypeIntact();
+
+			const outcome = await executeForAllItems({
+				code: `
+					const obj = {};
+					Reflect.setPrototypeOf(obj, { maliciousKey: 'value' });
+					return [{ json: { prototypeChanged: obj.maliciousKey !== undefined } }];
+				`,
+				inputItems: [{ a: 1 }],
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ prototypeChanged: false })]);
+			checkPrototypeIntact();
+		});
+
+		test('Object.setPrototypeOf should no-op for incoming object', async () => {
+			checkPrototypeIntact();
+
+			const outcome = await executeForAllItems({
+				code: `
+					const obj = $input.first();
+					Object.setPrototypeOf(obj, { maliciousKey: 'value' });
+					return [{ json: { prototypeChanged: obj.maliciousKey !== undefined } }];
+				`,
+				inputItems: [{ a: 1 }],
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ prototypeChanged: false })]);
+			checkPrototypeIntact();
+		});
+
+		test('Reflect.setPrototypeOf should no-op for incoming object', async () => {
+			checkPrototypeIntact();
+
+			const outcome = await executeForAllItems({
+				code: `
+					const obj = $input.first();
+					Reflect.setPrototypeOf(obj, { maliciousKey: 'value' });
+					return [{ json: { prototypeChanged: obj.maliciousKey !== undefined } }];
+				`,
+				inputItems: [{ a: 1 }],
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ prototypeChanged: false })]);
+			checkPrototypeIntact();
+		});
+
+		test('should freeze luxon prototypes', async () => {
+			const outcome = await executeForAllItems({
+				code: `
+				[DateTime, Interval, Duration]
+						.forEach(constructor => {
+								constructor.prototype.maliciousKey = 'value';
+						});
+
+				return []
+				`,
+				inputItems: [{ a: 1 }],
+			});
+
+			expect(outcome.result).toEqual([]);
+
+			// @ts-expect-error Non-existing property
+			expect(DateTime.now().maliciousKey).toBeUndefined();
+			// @ts-expect-error Non-existing property
+			expect(Interval.fromISO('P1Y2M10DT2H30M').maliciousKey).toBeUndefined();
+			// @ts-expect-error Non-existing property
+			expect(Duration.fromObject({ hours: 1 }).maliciousKey).toBeUndefined();
+		});
+
+		it('should allow prototype mutation when `insecureMode` is true', async () => {
+			const runner = createRunnerWithOpts({
+				insecureMode: true,
+			});
+
+			const outcome = await executeForAllItems({
+				code: `
+					const obj = {};
+
+					Object.prototype.maliciousProperty = 'compromised';
+
+					return [{ json: {
+						prototypeMutated: obj.maliciousProperty === 'compromised'
+					}}];
+				`,
+				inputItems: [{ a: 1 }],
+				runner,
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ prototypeMutated: true })]);
+
+			// @ts-expect-error Non-existing property
+			delete Object.prototype.maliciousProperty;
+		});
+	});
+
+	describe('stack trace', () => {
+		it('should extract correct line number from user-defined function stack trace', async () => {
+			const runner = createRunnerWithOpts({});
+			const taskId = '1';
+			const task = newTaskState(taskId);
+			const taskSettings: JSExecSettings = {
+				code: 'function my_function() {\n  null.map();\n}\nmy_function();\nreturn []',
+				nodeMode: 'runOnceForAllItems',
+				continueOnFail: false,
+				workflowMode: 'manual',
+			};
+			runner.runningTasks.set(taskId, task);
+
+			const sendSpy = jest.spyOn(runner.ws, 'send').mockImplementation(() => {});
+			jest.spyOn(runner, 'sendOffers').mockImplementation(() => {});
+			jest
+				.spyOn(runner, 'requestData')
+				.mockResolvedValue(newDataRequestResponse([wrapIntoJson({ a: 1 })]));
+
+			await runner.receivedSettings(taskId, taskSettings);
+
+			expect(sendSpy).toHaveBeenCalled();
+			const calledWith = sendSpy.mock.calls[0][0] as string;
+			expect(typeof calledWith).toBe('string');
+			const calledObject = JSON.parse(calledWith);
+			expect(calledObject).toEqual({
+				type: 'runner:taskerror',
+				taskId,
+				error: {
+					stack: expect.any(String),
+					message: expect.stringContaining('Cannot read properties of null'),
+					description: 'TypeError',
+					lineNumber: 2, // from user-defined function
+				},
+			});
+		});
+	});
+
+	describe('expressions', () => {
+		it('should evaluate expressions with $evaluateExpression', async () => {
+			const outcome = await executeForAllItems({
+				code: "return { val: $evaluateExpression('{{ 1 + 1 }}') }",
+				inputItems: [],
+			});
+
+			expect(outcome.result).toEqual([wrapIntoJson({ val: 2 })]);
 		});
 	});
 });
